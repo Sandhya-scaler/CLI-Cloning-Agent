@@ -9,29 +9,74 @@ const client = new OpenAI({
 });
 
 const systemPrompt = `
-You are an AI Assistant who works on a THINK, TOOL, OBSERVE, and OUTPUT format.
-You will break down major problems into smaller steps and do multiple thinking steps before providing an output.
+You are an AI CLI Agent that works strictly in a THINK → TOOL → OBSERVE → OUTPUT loop.
 
-Tools available:
-1. createDirectory(dirPath: string): Creates a new directory.
-2. createFile(filePath: string, content: string): Creates a new file with the specified content. Note: filePath should be relative. If the directory does not exist, it will be created automatically.
-3. executeCommand(cmd: string): Executes a CLI command.
+You have access to the following tools:
+1. createDirectory(dirPath: string)       — Creates a directory (recursive).
+2. createFile(filePath: string, content: string) — Creates a file with the given content.
+3. executeCommand(cmd: string)            — Runs a shell command and returns its output.
 
-Rules:
-1. You must ALWAYS respond with EXACTLY ONE valid JSON object. NEVER output a JSON array.
-2. The JSON object must have these keys: "step", "content", "tool_name", "tool_args". "tool_name" and "tool_args" are optional depending on the step. "content" should always be present.
-3. The "step" must be one of: "START", "THINK", "TOOL", "OBSERVE", "OUTPUT".
-4. CRITICAL: You must ONLY output ONE step at a time. After outputting a "TOOL" step, you MUST STOP and wait for the developer to provide the "OBSERVE" step. DO NOT hallucinate tool results.
-5. Use "OUTPUT" only when you have completely finished the user's task.
+STRICT RULES:
+1. Always respond with EXACTLY ONE valid JSON object per turn. Never output an array or multiple objects.
+2. Required JSON keys: "step" (always), "content" (always), "tool_name" (only for TOOL step), "tool_args" (only for TOOL step).
+3. Valid step values: "START" | "THINK" | "TOOL" | "OBSERVE" | "OUTPUT"
+4. After every TOOL step you MUST stop and wait for the OBSERVE step from the developer. Never fabricate or assume tool results.
+5. Do NOT open files in a browser automatically. Just create the files and tell the user to open them manually.
+6. When creating HTML/CSS/JS files, write the COMPLETE file content inline — do not truncate or use placeholders.
+7. Use "OUTPUT" only when the task is fully done.
 
-Example:
-User: "Create a folder named src"
-Assistant: { "step": "START", "content": "User wants to create a src folder" }
-Assistant: { "step": "THINK", "content": "I should use createDirectory tool" }
-Assistant: { "step": "TOOL", "content": "Calling tool", "tool_name": "createDirectory", "tool_args": { "dirPath": "src" } }
-Developer: { "step": "OBSERVE", "content": "Directory src created successfully." }
-Assistant: { "step": "OUTPUT", "content": "I have created the src folder as requested." }
+When asked to clone or replicate the Scaler Academy website, you must:
+- Create a folder named "scaler_clone"
+- Create index.html with a complete, visually rich page that includes:
+    • A sticky navigation bar with Scaler logo text and nav links
+    • A hero section with a headline, subtext, and a CTA button
+    • A features/stats section (e.g., students placed, avg salary hike, companies)
+    • A courses section with cards
+    • A footer with links and copyright
+- Use internal <style> and <script> tags (single HTML file)
+- Use a dark/professional color scheme matching Scaler's brand (#1a1a2e, #16213e, #0f3460, accent #e94560)
+- Make it responsive with modern CSS (flexbox/grid)
+
+Example flow:
+User: "Clone the Scaler website"
+{ "step": "START", "content": "User wants me to clone the Scaler Academy website." }
+{ "step": "THINK", "content": "I will create a scaler_clone folder and then create a complete index.html." }
+{ "step": "TOOL", "content": "Creating directory", "tool_name": "createDirectory", "tool_args": { "dirPath": "scaler_clone" } }
+[wait for OBSERVE]
+{ "step": "TOOL", "content": "Creating index.html", "tool_name": "createFile", "tool_args": { "filePath": "scaler_clone/index.html", "content": "...full HTML..." } }
+[wait for OBSERVE]
+{ "step": "OUTPUT", "content": "Done! Open scaler_clone/index.html in your browser." }
 `;
+
+// Max retries before giving up and asking user to retry
+const MAX_API_RETRIES = 3;
+
+async function callAPIWithRetry(client, payload) {
+    let attempts = 0;
+    while (attempts < MAX_API_RETRIES) {
+        try {
+            const response = await client.chat.completions.create(payload);
+            return response;
+        } catch (err) {
+            const isRetryable = err.message && (
+                err.message.includes('503') ||
+                err.message.includes('502') ||
+                err.message.includes('429') ||
+                err.message.includes('ECONNRESET') ||
+                err.message.includes('timeout')
+            );
+
+            if (isRetryable && attempts < MAX_API_RETRIES - 1) {
+                attempts++;
+                const waitSec = attempts * 5;
+                console.log(`\n[SYSTEM] API error (${err.message.slice(0, 60)}). Retrying in ${waitSec}s... (attempt ${attempts}/${MAX_API_RETRIES - 1})`);
+                await new Promise(resolve => setTimeout(resolve, waitSec * 1000));
+            } else {
+                throw err; // Non-retryable or exhausted retries
+            }
+        }
+    }
+}
 
 async function main() {
     const rl = readline.createInterface({
@@ -39,111 +84,175 @@ async function main() {
         output: process.stdout
     });
 
-    console.log("====================================");
-    console.log("Welcome to the AI CLI Agent! (Powered by OpenRouter)");
-    console.log("Type your command below. (Type 'exit' to quit)");
-    console.log("====================================\n");
+    console.log("============================================");
+    console.log("  Welcome to the AI CLI Agent!");
+    console.log("  Powered by OpenRouter");
+    console.log("  Type your instruction below.");
+    console.log("  Type 'exit' to quit.");
+    console.log("============================================\n");
 
-    let messageHistory = [
+    const messageHistory = [
         { role: "system", content: systemPrompt }
     ];
 
+    const targetModel = process.env.OPENROUTER_MODEL
+        ? process.env.OPENROUTER_MODEL.trim()
+        : 'openrouter/owl-alpha';
+
+    console.log(`[SYSTEM] Using model: ${targetModel}\n`);
+
     while (true) {
-        const userInput = await rl.question("User: ");
+        const userInput = await rl.question("You: ");
+
         if (userInput.toLowerCase() === 'exit') {
-            console.log("Goodbye!");
+            console.log("\nGoodbye!");
             rl.close();
             break;
         }
 
-        // Add user message to history
+        if (!userInput.trim()) continue;
+
         messageHistory.push({ role: "user", content: userInput });
 
-        while (true) {
+        // Inner agent loop — runs until OUTPUT or unrecoverable error
+        let agentLoopActive = true;
+        let consecutiveErrors = 0;
+        const MAX_CONSECUTIVE_ERRORS = 3;
+
+        while (agentLoopActive) {
             let response;
+
             try {
-                // Determine model, default to a high-quality free model on OpenRouter
-                const targetModel = process.env.OPENROUTER_MODEL ? process.env.OPENROUTER_MODEL.trim() : 'google/gemma-4-31b-it:free';
-                
-                response = await client.chat.completions.create({
+                response = await callAPIWithRetry(client, {
                     model: targetModel,
                     messages: messageHistory,
                     response_format: { type: "json_object" }
                 });
             } catch (err) {
-                if (err.message && (err.message.includes('503') || err.message.includes('429'))) {
-                    console.log(`\n[SYSTEM] API is busy or Network Error. Auto-retrying in 5 seconds...`);
-                    await new Promise(resolve => setTimeout(resolve, 5000));
-                    continue; // Retry the exact same request
-                }
-                console.error("\n[SYSTEM] Error communicating with OpenRouter API:", err.message);
+                console.error(`\n[SYSTEM] Failed to reach API after ${MAX_API_RETRIES} attempts: ${err.message}`);
+                console.log("[SYSTEM] Please check your API key, rate limits, or try a different model.\n");
+                agentLoopActive = false;
+                // Remove the failed user message so we can retry
+                messageHistory.pop();
                 break;
             }
 
-            const content = response.choices[0].message.content;
-            
-            let parsedContent;
+            const rawContent = response.choices[0].message.content;
+
+            // Parse JSON
+            let parsed;
             try {
-                parsedContent = JSON.parse(content);
-                if (Array.isArray(parsedContent)) {
-                    parsedContent = parsedContent[0];
+                parsed = JSON.parse(rawContent);
+                // Some models wrap in an array — unwrap
+                if (Array.isArray(parsed)) parsed = parsed[0];
+            } catch (_) {
+                consecutiveErrors++;
+                console.log(`\n[SYSTEM] Invalid JSON received (attempt ${consecutiveErrors}/${MAX_CONSECUTIVE_ERRORS}):`);
+                console.log(rawContent);
+
+                if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
+                    console.log("[SYSTEM] Too many invalid responses. Aborting this request.\n");
+                    agentLoopActive = false;
+                    break;
                 }
-            } catch (error) {
-                console.log("\n[SYSTEM] Error parsing JSON:", content);
-                messageHistory.push({ role: 'assistant', content: JSON.stringify({ step: "THINK", content: "I must output valid JSON." }) });
+
+                messageHistory.push({
+                    role: 'assistant',
+                    content: JSON.stringify({ step: "THINK", content: "My last response was not valid JSON. I must output a single valid JSON object." })
+                });
                 continue;
             }
 
+            consecutiveErrors = 0; // Reset on successful parse
+
+            // Push assistant message to history
             messageHistory.push({
                 role: 'assistant',
-                content: JSON.stringify(parsedContent)
+                content: JSON.stringify(parsed)
             });
 
-            if (parsedContent.step === "START") {
-                console.log(`\n🤖 [START] ${parsedContent.content}`);
-            } else if (parsedContent.step === "THINK") {
-                console.log(`\n🧠 [THINK] ${parsedContent.content}`);
-            } else if (parsedContent.step === "TOOL") {
-                console.log(`\n🔧 [TOOL] Calling ${parsedContent.tool_name} with args:`, parsedContent.tool_args);
-                
-                if (!toolsMap[parsedContent.tool_name]) {
-                    const observeMsg = { step: "OBSERVE", content: "This tool is not available." };
-                    console.log(`\n👀 [OBSERVE] ${observeMsg.content}`);
-                    messageHistory.push({
-                        role: "user", 
-                        content: JSON.stringify(observeMsg)
-                    });
-                } else {
-                    let data;
-                    // Safely handle different ways models might pass arguments
-                    try {
-                        if (parsedContent.tool_name === "createFile" && typeof parsedContent.tool_args === "object") {
-                            data = await toolsMap[parsedContent.tool_name](parsedContent.tool_args.filePath, parsedContent.tool_args.content);
-                        } else if (parsedContent.tool_name === "createDirectory" && typeof parsedContent.tool_args === "object") {
-                            data = await toolsMap[parsedContent.tool_name](parsedContent.tool_args.dirPath);
-                        } else if (parsedContent.tool_name === "executeCommand" && typeof parsedContent.tool_args === "object") {
-                            data = await toolsMap[parsedContent.tool_name](parsedContent.tool_args.cmd);
-                        } else {
-                            data = await toolsMap[parsedContent.tool_name](parsedContent.tool_args);
-                        }
-                    } catch (e) {
-                        data = "Error executing tool: " + e.message;
+            // Handle each step
+            switch (parsed.step) {
+                case "START":
+                    console.log(`\n🚀 [START] ${parsed.content}`);
+                    break;
+
+                case "THINK":
+                    console.log(`\n🧠 [THINK] ${parsed.content}`);
+                    break;
+
+                case "TOOL": {
+                    const toolName = parsed.tool_name;
+                    const toolArgs = parsed.tool_args;
+
+                    console.log(`\n🔧 [TOOL] ${toolName}`);
+                    if (toolArgs) {
+                        // Print args but truncate large content for readability
+                        const preview = JSON.stringify(toolArgs);
+                        console.log(`   Args: ${preview.length > 200 ? preview.slice(0, 200) + '...' : preview}`);
                     }
 
-                    const observeMsg = { step: "OBSERVE", content: data };
-                    console.log(`\n👀 [OBSERVE] ${observeMsg.content}\n`);
+                    let observeContent;
+
+                    if (!toolsMap[toolName]) {
+                        observeContent = `Tool "${toolName}" is not available. Available tools: ${Object.keys(toolsMap).join(', ')}`;
+                    } else {
+                        try {
+                            let result;
+                            if (typeof toolArgs === 'object' && toolArgs !== null) {
+                                switch (toolName) {
+                                    case 'createFile':
+                                        result = await toolsMap.createFile(toolArgs.filePath, toolArgs.content);
+                                        break;
+                                    case 'createDirectory':
+                                        result = await toolsMap.createDirectory(toolArgs.dirPath);
+                                        break;
+                                    case 'executeCommand':
+                                        result = await toolsMap.executeCommand(toolArgs.cmd);
+                                        break;
+                                    default:
+                                        result = await toolsMap[toolName](toolArgs);
+                                }
+                            } else {
+                                result = await toolsMap[toolName](toolArgs);
+                            }
+                            observeContent = result;
+                        } catch (e) {
+                            observeContent = `Tool execution error: ${e.message}`;
+                        }
+                    }
+
+                    // Truncate very long observe content before pushing to history
+                    const truncated = typeof observeContent === 'string' && observeContent.length > 500
+                        ? observeContent.slice(0, 500) + '... [truncated]'
+                        : observeContent;
+
+                    console.log(`\n👀 [OBSERVE] ${truncated}\n`);
+
                     messageHistory.push({
                         role: "user",
-                        content: JSON.stringify(observeMsg)
+                        content: JSON.stringify({ step: "OBSERVE", content: truncated })
                     });
+                    break;
                 }
-            } else if (parsedContent.step === "OUTPUT") {
-                console.log(`\n✅ [OUTPUT] ${parsedContent.content}\n`);
-                break;
-            } else {
-                console.log(`\n❓ [UNKNOWN STEP]`, parsedContent);
-                // Try to recover
-                messageHistory.push({ role: 'assistant', content: JSON.stringify({ step: "THINK", content: "I used an invalid step. I must use START, THINK, TOOL, or OUTPUT." }) });
+
+                case "OUTPUT":
+                    console.log(`\n✅ [OUTPUT] ${parsed.content}\n`);
+                    agentLoopActive = false;
+                    break;
+
+                default:
+                    console.log(`\n❓ [UNKNOWN STEP: ${parsed.step}]`, parsed);
+                    consecutiveErrors++;
+                    if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
+                        console.log("[SYSTEM] Too many unknown steps. Aborting.\n");
+                        agentLoopActive = false;
+                    } else {
+                        messageHistory.push({
+                            role: 'assistant',
+                            content: JSON.stringify({ step: "THINK", content: `"${parsed.step}" is not a valid step. I must use START, THINK, TOOL, or OUTPUT.` })
+                        });
+                    }
             }
         }
     }
